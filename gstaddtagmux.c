@@ -95,6 +95,18 @@ gst_add_tag_mux_pad_class_init(
 }
 
 static GstFlowReturn
+gst_add_tag_mux_pad_sink_chain_eos(
+    GstPad *		pad,
+    GstObject *		parent,
+    GstBuffer *		buffer)
+{
+    GST_TRACE_OBJECT(pad, ">");
+    GST_WARNING_OBJECT(pad, "EOS");
+    GST_TRACE_OBJECT(pad, "< EOS");
+    return GST_FLOW_EOS;
+}
+
+static GstFlowReturn
 gst_add_tag_mux_pad_sink_chain(
     GstPad *		pad,
     GstObject *		parent,
@@ -116,6 +128,7 @@ gst_add_tag_mux_pad_sink_chain(
 	    GST_TAG_IMAGE, sample,
 	    NULL);
 	g_mutex_unlock(&addtagmux->mutex);
+	gst_sample_unref(sample);
     }
     gst_buffer_unref(buffer);
 
@@ -145,10 +158,12 @@ static gboolean gst_add_tag_mux_pad_sink_event(
     GST_TRACE_OBJECT(pad, ">");
     switch (GST_EVENT_TYPE(event)) {
 	case GST_EVENT_EOS: {
+	    gst_pad_set_chain_function(pad,
+		GST_DEBUG_FUNCPTR(gst_add_tag_mux_pad_sink_chain_eos));
 	    GstAddTagMux * addtagmux = GST_ADD_TAG_MUX(parent);
 	    g_mutex_lock(&addtagmux->mutex);
 	    --addtagmux->count;
-	    GST_DEBUG_OBJECT(pad, "EOS %d %p", addtagmux->count, addtagmux);
+	    GST_DEBUG_OBJECT(pad, "EOS %d", addtagmux->count);
 	    if (!addtagmux->count) {
 		g_cond_signal(&addtagmux->cond);
 	    }
@@ -215,7 +230,9 @@ gst_add_tag_mux_finalize(
     GstAddTagMux * addtagmux = GST_ADD_TAG_MUX(object);
     g_cond_clear(&addtagmux->cond);
     g_mutex_clear(&addtagmux->mutex);
-    gst_tag_list_unref(addtagmux->taglist);
+    if (addtagmux->taglist) {
+	gst_tag_list_unref(addtagmux->taglist);
+    }
 
     G_OBJECT_CLASS(gst_add_tag_mux_parent_class)->finalize(object);
     GST_TRACE("<");
@@ -350,7 +367,7 @@ gst_add_tag_mux_class_init(
 	"Ross Tyler");
 
     // must add REQUEST SINK pad before ALWAYS SINK pad
-    // or else pipeline may not link correctly and issue a
+    // or else pipeline may not link correctly and issue, for example, a
     // WARNING: erroneous pipeline: could not link filesrc0 to addtagmux
     gst_element_class_add_pad_template(element_class,
 	gst_static_pad_template_get(&gst_add_tag_mux_pad_sink_template));
@@ -373,7 +390,7 @@ gst_add_tag_mux_class_init(
 }
 
 static GstFlowReturn
-gst_add_tag_mux_sink_chain(
+gst_add_tag_mux_sink_chain_identity(
     GstPad *		pad,
     GstObject *		parent,
     GstBuffer *		buffer)
@@ -384,55 +401,19 @@ gst_add_tag_mux_sink_chain(
     return ret;
 }
 
-static gboolean gst_add_tag_mux_sink_event(
+static gboolean gst_add_tag_mux_sink_event_identity(
     GstPad *		pad,
     GstObject *		parent,
     GstEvent *		event)
 {
     GST_TRACE_OBJECT(pad, ">");
-
-    gboolean ret;
-    switch (GST_EVENT_TYPE(event)) {
-	case GST_EVENT_TAG: {
-	    // the taglist might be repeated with updates to statistical tags
-	    // e.g. minimum-bitrate, bitrate and maximum-bitrate.
-	    // we add our taglist to each one.
-	    GstTagList * taglist;
-	    gst_event_parse_tag(event, &taglist);
-
-	    {
-		gchar * string = gst_tag_list_to_string(taglist);
-		GST_DEBUG_OBJECT(pad, "%s", string);
-		g_free(string);
-	    }
-
-	    GstAddTagMux * addtagmux = GST_ADD_TAG_MUX(parent);
-	    g_mutex_lock(&addtagmux->mutex);
-	    GstTagList * merged = gst_tag_list_merge(
-		taglist, addtagmux->taglist, GST_TAG_MERGE_APPEND);
-	    g_mutex_unlock(&addtagmux->mutex);
-
-	    {
-		gchar * string = gst_tag_list_to_string(merged);
-		GST_DEBUG_OBJECT(pad, "%s", string);
-		g_free(string);
-	    }
-
-	    event = gst_event_new_tag(merged);
-	    ret = gst_pad_push_event(GST_ADD_TAG_MUX(parent)->src, event);
-	    break;
-	}
-	default:
-	    ret = gst_pad_push_event(GST_ADD_TAG_MUX(parent)->src, event);
-	    break;
-    }
-
+    gboolean ret = gst_pad_push_event(GST_ADD_TAG_MUX(parent)->src, event);
     GST_TRACE_OBJECT(pad, "< %d", ret);
     return ret;
 }
 
 static GstFlowReturn
-gst_add_tag_mux_src_getrange(
+gst_add_tag_mux_src_getrange_identity(
     GstPad *		pad,
     GstObject *		parent,
     guint64		offset,
@@ -447,24 +428,40 @@ gst_add_tag_mux_src_getrange(
     return ret;
 }
 
-static void
+static gboolean
 gst_add_tag_mux_wait(
     GstAddTagMux *	addtagmux)
 {
     GST_TRACE_OBJECT(addtagmux, ">");
+
+    // wait while there are additional pads still streaming
     g_mutex_lock(&addtagmux->mutex);
     while (addtagmux->count) {
 	GST_DEBUG_OBJECT(addtagmux, "wait %d", addtagmux->count);
 	g_cond_wait(&addtagmux->cond, &addtagmux->mutex);
     }
-    gst_pad_set_chain_function(addtagmux->sink,
-	GST_DEBUG_FUNCPTR(gst_add_tag_mux_sink_chain));
-    gst_pad_set_event_function(addtagmux->sink,
-	GST_DEBUG_FUNCPTR(gst_add_tag_mux_sink_event));
-    gst_pad_set_getrange_function(addtagmux->src,
-	GST_DEBUG_FUNCPTR(gst_add_tag_mux_src_getrange));
     g_mutex_unlock(&addtagmux->mutex);
+
+    // push our taglist as an event downstream if it has any tags
+    gboolean ret;
+    if (gst_tag_list_is_empty(addtagmux->taglist)) {
+	ret = TRUE;
+    } else {
+	GstEvent * event = gst_event_new_tag(addtagmux->taglist);
+	addtagmux->taglist = 0;		// transferred to event
+	ret = gst_pad_push_event(addtagmux->src, event);
+    }
+
+    // use *_identity transforms/methods from now on
+    gst_pad_set_chain_function(addtagmux->sink,
+	GST_DEBUG_FUNCPTR(gst_add_tag_mux_sink_chain_identity));
+    gst_pad_set_event_function(addtagmux->sink,
+	GST_DEBUG_FUNCPTR(gst_add_tag_mux_sink_event_identity));
+    gst_pad_set_getrange_function(addtagmux->src,
+	GST_DEBUG_FUNCPTR(gst_add_tag_mux_src_getrange_identity));
+
     GST_TRACE_OBJECT(addtagmux, "<");
+    return ret;
 }
 
 static GstFlowReturn
@@ -475,7 +472,8 @@ gst_add_tag_mux_sink_chain_wait(
 {
     GST_TRACE_OBJECT(pad, ">");
     gst_add_tag_mux_wait(GST_ADD_TAG_MUX(parent));
-    GstFlowReturn ret = gst_add_tag_mux_sink_chain(pad, parent, buffer);
+    GstFlowReturn ret = gst_add_tag_mux_sink_chain_identity(
+	pad, parent, buffer);
     GST_TRACE_OBJECT(pad, "< %d", ret);
     return ret;
 }
@@ -487,7 +485,7 @@ static gboolean gst_add_tag_mux_sink_event_wait(
 {
     GST_TRACE_OBJECT(pad, ">");
     gst_add_tag_mux_wait(GST_ADD_TAG_MUX(parent));
-    gboolean ret = gst_add_tag_mux_sink_event(pad, parent, event);
+    gboolean ret = gst_add_tag_mux_sink_event_identity(pad, parent, event);
     GST_TRACE_OBJECT(pad, "< %d", ret);
     return ret;
 }
@@ -502,14 +500,14 @@ gst_add_tag_mux_src_getrange_wait(
 {
     GST_TRACE_OBJECT(pad, ">");
     gst_add_tag_mux_wait(GST_ADD_TAG_MUX(parent));
-    GstFlowReturn ret
-	= gst_add_tag_mux_src_getrange(pad, parent, offset, length, buffer);
+    GstFlowReturn ret = gst_add_tag_mux_src_getrange_identity(
+	pad, parent, offset, length, buffer);
     GST_TRACE_OBJECT(pad, "< %d", ret);
     return ret;
 }
 
 static gboolean
-gst_add_tag_mux_src_event(
+gst_add_tag_mux_src_event_identity(
     GstPad *		pad,
     GstObject *		parent,
     GstEvent *		event)
@@ -545,7 +543,7 @@ gst_add_tag_mux_init(
     gst_pad_set_getrange_function(pad,
 	GST_DEBUG_FUNCPTR(gst_add_tag_mux_src_getrange_wait));
     gst_pad_set_event_function(pad,
-	GST_DEBUG_FUNCPTR(gst_add_tag_mux_src_event));
+	GST_DEBUG_FUNCPTR(gst_add_tag_mux_src_event_identity));
     gst_element_add_pad(element, pad);
 
     g_mutex_init(&addtagmux->mutex);
