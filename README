@@ -1,0 +1,202 @@
+gstreamer 1.0 addtagmux element plugin for embedded album art.
+
+USAGE
+
+The addtagmux element multiplexes content from additional streams as tags.
+Inserting an addtagmux element in a pipeline by itself does nothing.
+When additional streams are added to its sinks, it will block the main stream
+until end of stream is reached on all the others.
+During this time, the additional stream content is gathered and converted
+to tags.
+When all additional streams have ended, these tags are pushed downstream
+and flow of the main stream is unblocked.
+
+This project is a companion to gstfs-ng
+(a FUSE-based file system for dynamic gstreamer-based transcoding).
+While addtagmux may be used independently, with gstfs-ng it allows
+a FLAC music archive appear as an MP3 or OGG archive
+with additional embedded album art from front-cover image files.
+
+Because of their long length and for illustration,
+gstreamer pipelines are folded into multiple lines here
+in conventional UNIX shell tradition (with backslashes before newlines).
+These might be run from such a shell by first setting some variables.
+For example,
+
+	source=/tmp/source
+	target=/tmp/target
+	song=song
+	cover=folder.jpg
+
+Preface each pipeline with the proper environment and command to
+interpret them.
+For example,
+
+	GST_PLUGIN_PATH=. gst-launch-1.0 \
+
+Consider a digital music collection
+that groups song files in album folders
+and illustrates each with a file that reflects the cover art.
+These files are encoded with quality in mind
+(e.g. lossless FLAC and high resolution jpeg).
+
+Unfortunately, many players cannot play such files
+and a medium may not have the capacity for a large collection of them.
+In such cases, conversion to smaller MP3 files may be desirable.
+Such can be done with a gstreamer pipeline (interpreted by gst-launch)
+to convert a $song from a FLAC $source folder
+to a parallel MP3 $target folder.
+
+	filesrc location=$source/$song.flac \
+	! flacparse ! flacdec ! audioconvert ! lamemp3enc ! id3v2mux \
+	! filesink location=$target/$song.mp3
+
+This will convert the FLAC audio file source to an MP3 encoding with id3v2 tags.
+The flacparse element is a tag reader
+and the id3v2mux element is a tag writer.
+A tag reader separates tags (metadata) from the data
+and a tag writer puts them back together.
+
+A downstream tag writer is essential for addtagmux.
+
+While this transcoding may be sufficient for many media players
+some do not recognize the album cover art shared by files in the same folder.
+For these, it would be nice to add such art as tags.
+
+Consider the following gstreamer pipeline with an addtagmux plugin inserted.
+
+	filesrc location=$source/$song.flac \
+		! addtagmux \
+	! flacparse ! flacdec ! audioconvert ! lamemp3enc ! id3v2mux \
+	! filesink location=$target/$song.mp3
+
+In this pipeline, addtagmux is does nothing.
+It acts as an identity transform that forwards everything it gets downstream.
+It provides an opportunity to multiplex additional
+upstream data and convert them to tags (metadata)
+that are combined with the metadata on the main stream.
+We can rewrite the above pipeline.
+
+	filesrc location=$source/$song.flac \
+		! addtagmux name=addtagmux \
+		addtagmux. \
+	! flacparse ! flacdec ! audioconvert ! lamemp3enc ! id3v2mux \
+	! filesink location=$target/$song.mp3
+
+Again, this is equivalent (adds no value)
+but writing it this way provides us a place
+to insert a stream to add the $cover data as an image tag.
+
+	filesrc location=$source/$song.flac \
+		! addtagmux name=addtagmux \
+		filesrc location=$source/$cover ! jpegparse \
+		! addtagmux. \
+		addtagmux. \
+	! flacparse ! flacdec ! audioconvert ! lamemp3enc ! id3v2mux \
+	! filesink location=$target/$song.mp3
+
+When addtagmux has such an additional stream(s),
+it will block all flow on the main stream
+until the additional stream(s) end.
+When they all end, but before the main stream is allowed to flow,
+all data from the additional streams that have been converted to tags
+are sent downstream first.
+Then the main stream flows unaltered.
+
+This additional stream takes $source/$cover,
+parses a complete image from it
+and passes it downstream to addtagmux in a single buffer.
+When addtagmux gets such a buffer, it detects the image/jpeg data
+and converts it to an image tag.
+
+A capsfilter element can be inserted before the addtagmux to type the image
+
+	image/jpeg,image-type=front-cover
+
+This capsfilter does nothing as the front-cover image-type is assumed.
+However, other image-types can be specified by name or nickname.
+Accepted names are published here:
+
+	http://gstreamer.freedesktop.org/data/doc/gstreamer/head/gst-plugins-base-libs/html/gst-plugins-base-libs-gsttag.html#GstTagImageType
+
+Unfortunately, the corresponding (more friendly) nicknames
+are not published but, as of this writing,
+gst-plugins-base/gst-libs/gst/tag/tags.c defines them to be
+
+	GST_TAG_IMAGE_TYPE_NONE				none
+	GST_TAG_IMAGE_TYPE_UNDEFINED			undefined
+	GST_TAG_IMAGE_TYPE_FRONT_COVER			front-cover
+	GST_TAG_IMAGE_TYPE_BACK_COVER			back-cover
+	GST_TAG_IMAGE_TYPE_LEAFLET_PAGE			leaflet-page
+	GST_TAG_IMAGE_TYPE_MEDIUM			medium
+	GST_TAG_IMAGE_TYPE_LEAD_ARTIST			lead-artist
+	GST_TAG_IMAGE_TYPE_ARTIST			artist
+	GST_TAG_IMAGE_TYPE_CONDUCTOR			conductor
+	GST_TAG_IMAGE_TYPE_BAND_ORCHESTRA		band-orchestra
+	GST_TAG_IMAGE_TYPE_COMPOSER			composer
+	GST_TAG_IMAGE_TYPE_LYRICIST			lyricist
+	GST_TAG_IMAGE_TYPE_RECORDING_LOCATION		recording-location
+	GST_TAG_IMAGE_TYPE_DURING_RECORDING		during-recording
+	GST_TAG_IMAGE_TYPE_DURING_PERFORMANCE		during-performance
+	GST_TAG_IMAGE_TYPE_VIDEO_CAPTURE		video-capture
+	GST_TAG_IMAGE_TYPE_FISH				fish
+	GST_TAG_IMAGE_TYPE_ILLUSTRATION			illustration
+	GST_TAG_IMAGE_TYPE_BAND_ARTIST_LOGO		artist-logo
+	GST_TAG_IMAGE_TYPE_PUBLISHER_STUDIO_LOGO	publisher-studio-logo
+
+Assuming the high resolution $cover is too big,
+elements may be inserted after jpegparse to decode,
+scale (say, to 300x300) and reencode it
+
+         jpegdec ! videoscale ! video/x-raw,width=300,height=300 ! jpegenc
+
+Putting it all together,
+a gstreamer pipeline to convert a $song from a FLAC $source folder
+to a parallel MP3 $target folder
+while inserting a scaled $cover as a front-cover image tag
+can be written as
+
+	filesrc location=$source/$song.flac \
+		! addtagmux name=addtagmux \
+		filesrc location=$source/$cover ! jpegparse \
+         	! jpegdec ! videoscale ! video/x-raw,width=300,height=300 ! jpegenc \
+		! image/jpeg,image-type=front-cover \
+		! addtagmux. \
+		addtagmux. \
+	! flacparse ! flacdec ! audioconvert ! lamemp3enc ! id3v2mux \
+	! filesink location=$target/$song.mp3
+
+Additional streams may be added to supply tags for other image-types.
+
+----
+
+BUILD
+
+Makefile may be used to build on Fedora 22 and 23 platorms.
+Your mileage may vary on others.
+
+Install dependent development packages to support
+glib-2.0, gstreamer-1.0 and gstreamer-tag-1.0:
+
+	dnf install glib2-devel
+	dnf install gstreamer1-devel
+	dnf install gstreamer1-plugins-base-devel
+
+Make libgstaddtagmux.so (the gstreamer addtagmux plugin):
+
+	make
+
+----
+
+INSTALLATION
+
+Set the GST_PLUGIN_PATH environment variable to include the directory 
+of libgstaddtagmux.so or copy the file to a well known gstreamer plugin
+directory.
+For example, on Fedora:
+
+	cp libgstaddtagmux.so /usr/lib64/gstreamer-1.0/
+
+Verify installation by inspecting the plugin:
+
+	gst-inspect-1.0 addtagmux

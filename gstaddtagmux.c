@@ -1,5 +1,5 @@
 /* GStreamer
- * Copyright (C) 2015 FIXME <fixme@example.com>
+ * Copyright (C) 2015 Ross Tyler
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -19,14 +19,39 @@
 /**
  * SECTION:element-gstaddtagmux
  *
- * The addtagmux element does FIXME stuff.
+ * The addtagmux element multiplexes content from additional streams as tags.
+ * Inserting an addtagmux element in a pipeline by itself does nothing.
+ * When additional streams are added to its sinks, it will block the main stream
+ * until end of stream is reached on all the others.
+ * During this time, the additional stream content is gathered and converted
+ * to tags.
+ * When all additional streams have ended, these tags are pushed downstream
+ * and flow of the main stream is unblocked.
+ *
+ * Currently, only image/jpeg, image/png and txt/uri-list additional
+ * content is recognized.
+ * Each buffer of such is turned into an image tag, the type of which
+ * may be specified by an image-type field of an upstream capsfilter element.
+ * Use a jpegparse element upstream to send a complete image in each buffer.
  *
  * <refsect2>
  * <title>Example launch line</title>
  * |[
- * gst-launch -v fakesrc ! addtagmux ! FIXME ! fakesink
+ * gst-launch filesrc location=0.flac \
+ *     ! addtagmux name=addtagmux \
+ *         filesrc location=folder.jpg ! jpegparse ! jpegdec \
+ *             ! videoscale ! video/x-raw,width=300,height=300 ! jpegenc \
+ *             ! image/jpeg,image-type=front-cover ! addtagmux. \
+ *     addtagmux. \
+ * ! flacparse ! flacdec ! audioconvert ! vorbisenc ! oggmux ! filesink location=0.ogg
  * ]|
- * FIXME Describe what the pipeline does.
+ * Removing the middle lines (leaving only the first and last) is a recipe
+ * for converting a flac audio encoding to ogg/vorbis.
+ * Using only the first two and last two lines does nothing more than insert
+ * an addtagmux element with no additional streams so the result is the same.
+ * The middle lines specify an additional stream that takes a jpeg image
+ * from folder.jpg, scales it to 300x300, says it is the front-cover
+ * and feeds it to addtagmux to add such a tag to the output.
  * </refsect2>
  */
 
@@ -114,14 +139,71 @@ gst_add_tag_mux_pad_sink_chain(
 {
     GST_TRACE_OBJECT(pad, ">");
 
-    GstCaps * caps = gst_type_find_helper_for_buffer(pad, buffer, NULL);
+    // guidance taken from
+    // gst-plugins-base/gst-libs/gst/tag/tags.c
+    // gst_tag_image_data_to_image_sample
+
+    GstCaps * caps
+        = gst_type_find_helper_for_buffer(GST_OBJECT(pad), buffer, NULL);
     if (caps) {
-	GST_DEBUG_OBJECT(pad, "caps %" GST_PTR_FORMAT, caps);
-	GstStructure * info = gst_structure_new("GstTagImageInfo",
-	    "image-type", GST_TYPE_TAG_IMAGE_TYPE, GST_TAG_IMAGE_TYPE_FRONT_COVER,
-	    NULL);
+	GST_DEBUG_OBJECT(pad, "caps buffer %" GST_PTR_FORMAT, caps);
+
+	gchar const * name
+	    = gst_structure_get_name(gst_caps_get_structure(caps, 0));
+	if (!g_str_has_prefix (name, "image/") &&
+		!g_str_equal (name, "text/uri-list")) {
+	    GST_WARNING_OBJECT(pad, "caps buffer not supported %"
+		GST_PTR_FORMAT, caps);
+	    gst_caps_unref(caps);
+	    gst_buffer_unref(buffer);
+	    GST_TRACE_OBJECT(pad, "< NOT SUPPORTED");
+	    return GST_FLOW_NOT_SUPPORTED;
+	}
+
+	GstTagImageType image_type = GST_TAG_IMAGE_TYPE_FRONT_COVER;
+	// change the default image_type from the current caps.
+	// this can be set with a capsfilter element with an image-type
+	// field whose string value can be converted (by name or nickname)
+	// to a GstTagImageType.
+	// For example, by inserting ...
+	//	image/jpeg,image-type=front-cover
+	// in the pipeline before us.
+	{
+	    GstCaps * c = gst_pad_get_current_caps(pad);
+	    GST_DEBUG_OBJECT(pad, "caps current %" GST_PTR_FORMAT, c);
+	    guint i = gst_caps_get_size(c);
+	    while (i--) {
+		gchar * n;
+		if (gst_structure_get(gst_caps_get_structure(c, i),
+			"image-type", G_TYPE_STRING, &n,
+			NULL)) {
+		    GEnumClass * e = g_type_class_ref(GST_TYPE_TAG_IMAGE_TYPE);
+		    GEnumValue * v;
+		    if (0
+			    || (v = g_enum_get_value_by_name(e, n))
+			    || (v = g_enum_get_value_by_nick(e, n))) {
+			GST_DEBUG_OBJECT(pad, "%d %s %s", v->value,
+			    v->value_name, v->value_nick);
+			image_type = (GstTagImageType) v->value;
+		    }
+		    g_type_class_unref(e);
+		    g_free(n);
+		}
+	    }
+	    gst_caps_unref(c);
+	}
+
+	// create sample for image tag
+	GstStructure * info = NULL;
+	if (GST_TAG_IMAGE_TYPE_NONE != image_type) {
+	    info = gst_structure_new("GstTagImageInfo",
+		"image-type", GST_TYPE_TAG_IMAGE_TYPE, image_type,
+		NULL);
+	}
 	GstSample * sample = gst_sample_new(buffer, caps, NULL, info);
 	gst_caps_unref(caps);
+
+	// append image tag with sample to our element's list
 	GstAddTagMux * addtagmux = GST_ADD_TAG_MUX(parent);
 	g_mutex_lock(&addtagmux->mutex);
 	gst_tag_list_add(addtagmux->taglist, GST_TAG_MERGE_APPEND,
@@ -136,7 +218,7 @@ gst_add_tag_mux_pad_sink_chain(
     return GST_FLOW_OK;
 }
 
-static GstPadLinkFunction gst_add_tag_mux_pad_link(
+static GstPadLinkReturn gst_add_tag_mux_pad_link(
     GstPad *		pad,
     GstObject *		parent,
     GstPad *		peer)
@@ -260,7 +342,7 @@ gst_add_tag_mux_request_new_pad(
     gchar * name
 	= g_strdup_printf(GST_PAD_TEMPLATE_NAME_TEMPLATE(template), index);
     GstPad * pad = g_object_new(GST_TYPE_ADD_TAG_MUX_PAD,
-	// properties set *after* object is initialized
+	// these properties are set *after* object is initialized
 	"name",		name,
 	"direction",	template->direction,
 	"template",	template,
@@ -281,46 +363,6 @@ gst_add_tag_mux_release_pad(
     GST_TRACE_OBJECT(element, "<");
 }
 
-static GstStateChangeReturn
-gst_add_tag_mux_change_state(
-    GstElement *	element,
-    GstStateChange	transition)
-{
-    GST_TRACE_OBJECT(element, "> %d to %d",
-	GST_STATE_TRANSITION_CURRENT(transition),
-	GST_STATE_TRANSITION_NEXT(transition));
-
-    GstStateChangeReturn ret;
-
-    switch (transition) {
-    case GST_STATE_CHANGE_NULL_TO_READY:
-	break;
-    case GST_STATE_CHANGE_READY_TO_PAUSED:
-	break;
-    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
-	break;
-    default:
-	break;
-    }
-
-    ret = GST_ELEMENT_CLASS(gst_add_tag_mux_parent_class)
-	->change_state(element, transition);
-
-    switch (transition) {
-    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
-	break;
-    case GST_STATE_CHANGE_PAUSED_TO_READY:
-	break;
-    case GST_STATE_CHANGE_READY_TO_NULL:
-	break;
-    default:
-	break;
-    }
-
-    GST_TRACE_OBJECT(element, "< %d", ret);
-    return ret;
-}
-
 /// A "sink_%u" SINK pad exists only on REQUEST
 /// and only supports streams that we can turn into tags
 static GstStaticPadTemplate gst_add_tag_mux_pad_sink_template =
@@ -330,7 +372,8 @@ GST_STATIC_PAD_TEMPLATE(
     GST_PAD_REQUEST,
     GST_STATIC_CAPS(
 	"image/jpeg;"
-	"image/png")
+	"image/png;"
+	"text/uri-list")
 );
 
 /// Our "sink" SINK pad ALWAYS exists and supports ANYthing
@@ -383,8 +426,6 @@ gst_add_tag_mux_class_init(
 	= GST_DEBUG_FUNCPTR(gst_add_tag_mux_request_new_pad);
     element_class->release_pad
 	= GST_DEBUG_FUNCPTR(gst_add_tag_mux_release_pad);
-    element_class->change_state
-	= GST_DEBUG_FUNCPTR(gst_add_tag_mux_change_state);
 
     GST_TRACE("<");
 }
